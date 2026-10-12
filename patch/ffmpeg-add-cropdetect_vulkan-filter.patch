@@ -1,0 +1,630 @@
+From 876e646fd12b81ae34ceb0cd7add3e785b707a45 Mon Sep 17 00:00:00 2001
+From: sohnyj <271139641+sohnyj@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 22:43:43 +0900
+Subject: [PATCH] avfilter: add cropdetect_vulkan filter
+
+Vulkan port of the black mode of cropdetect. A compute shader sums up
+the luma plane per row and per column, and the borders are then searched
+on the CPU with the logic of vf_cropdetect.c, so that the metadata and
+the log output match those of the software filter.
+
+The samples are read as integers and shifted down to their code values,
+and the sums are bounded by the frame size, as the images of hardware
+decoders may be larger than the frame.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ configure                               |   1 +
+ doc/filters.texi                        |   6 +-
+ libavfilter/Makefile                    |   1 +
+ libavfilter/allfilters.c                |   1 +
+ libavfilter/vf_cropdetect_vulkan.c      | 458 ++++++++++++++++++++++++
+ libavfilter/vulkan/Makefile             |   1 +
+ libavfilter/vulkan/cropdetect.comp.glsl |  58 +++
+ 7 files changed, 525 insertions(+), 1 deletion(-)
+ create mode 100644 libavfilter/vf_cropdetect_vulkan.c
+ create mode 100644 libavfilter/vulkan/cropdetect.comp.glsl
+
+diff --git a/configure b/configure
+index f316113..c773a75 100755
+--- a/configure
++++ b/configure
+@@ -4149,6 +4149,7 @@ coreimagesrc_filter_deps="coreimage appkit"
+ coreimagesrc_filter_extralibs="-framework OpenGL"
+ cover_rect_filter_deps="avcodec avformat gpl"
+ cropdetect_filter_deps="gpl"
++cropdetect_vulkan_filter_deps="gpl vulkan spirv_compiler"
+ deinterlace_qsv_filter_deps="libmfx"
+ deinterlace_qsv_filter_select="qsvvpp"
+ deinterlace_vaapi_filter_deps="vaapi"
+diff --git a/doc/filters.texi b/doc/filters.texi
+index 04496d3..099b0a4 100644
+--- a/doc/filters.texi
++++ b/doc/filters.texi
+@@ -11017,7 +11017,7 @@ If the specified expression is not valid, it is kept at its current
+ value.
+ @end table
+ 
+-@section cropdetect
++@section cropdetect, cropdetect_vulkan
+ 
+ Auto-detect the crop size.
+ 
+@@ -11025,6 +11025,10 @@ It calculates the necessary cropping parameters and prints the
+ recommended parameters via the logging system. The detected dimensions
+ correspond to the non-black or video area of the input video according to @var{mode}.
+ 
++The Vulkan variant @code{cropdetect_vulkan} only implements the @samp{black}
++mode on planar YUV input. It does not accept the @option{mode},
++@option{mv_threshold}, @option{low} and @option{high} options.
++
+ It accepts the following parameters:
+ 
+ @table @option
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index 15d0b23..8a4c1eb 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -263,6 +263,7 @@ OBJS-$(CONFIG_CORR_FILTER)                   += vf_corr.o framesync.o
+ OBJS-$(CONFIG_COVER_RECT_FILTER)             += vf_cover_rect.o lavfutils.o
+ OBJS-$(CONFIG_CROP_FILTER)                   += vf_crop.o
+ OBJS-$(CONFIG_CROPDETECT_FILTER)             += vf_cropdetect.o edge_common.o
++OBJS-$(CONFIG_CROPDETECT_VULKAN_FILTER)      += vf_cropdetect_vulkan.o vulkan.o vulkan_filter.o
+ OBJS-$(CONFIG_CUE_FILTER)                    += f_cue.o
+ OBJS-$(CONFIG_CURVES_FILTER)                 += vf_curves.o
+ OBJS-$(CONFIG_DATASCOPE_FILTER)              += vf_datascope.o
+diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
+index 931ac84..2437bec 100644
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -239,6 +239,7 @@ extern const FFFilter ff_vf_corr;
+ extern const FFFilter ff_vf_cover_rect;
+ extern const FFFilter ff_vf_crop;
+ extern const FFFilter ff_vf_cropdetect;
++extern const FFFilter ff_vf_cropdetect_vulkan;
+ extern const FFFilter ff_vf_cue;
+ extern const FFFilter ff_vf_curves;
+ extern const FFFilter ff_vf_datascope;
+diff --git a/libavfilter/vf_cropdetect_vulkan.c b/libavfilter/vf_cropdetect_vulkan.c
+new file mode 100644
+index 0000000..c26318b
+--- /dev/null
++++ b/libavfilter/vf_cropdetect_vulkan.c
+@@ -0,0 +1,458 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with FFmpeg; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++/**
++ * @file
++ * border detection filter
++ * Vulkan port of the black mode of vf_cropdetect.c.
++ */
++
++#include "libavutil/opt.h"
++#include "libavutil/pixdesc.h"
++#include "vulkan_filter.h"
++
++#include "filters.h"
++
++extern const unsigned char ff_cropdetect_comp_spv_data[];
++extern const unsigned int ff_cropdetect_comp_spv_len;
++
++typedef struct CropDetectVulkanContext {
++    FFVulkanContext vkctx;
++
++    int initialized;
++    FFVkExecPool e;
++    AVVulkanDeviceQueueFamily *qf;
++    FFVulkanShader shd;
++    AVRefStructPool *sum_buf_pool;
++
++    int x1, y1, x2, y2;
++    float limit;
++    float limit_upscaled;
++    int round;
++    int skip;
++    int reset_count;
++    int frame_nb;
++    int max_outliers;
++    int bitdepth;
++} CropDetectVulkanContext;
++
++static av_cold int init_filter(AVFilterContext *ctx)
++{
++    int err;
++    CropDetectVulkanContext *s = ctx->priv;
++    FFVulkanContext *vkctx = &s->vkctx;
++    const AVFilterLink *inlink = ctx->inputs[0];
++    const AVPixFmtDescriptor *pixdesc = av_pix_fmt_desc_get(s->vkctx.input_format);
++
++    s->qf = ff_vk_qf_find(vkctx, VK_QUEUE_COMPUTE_BIT, 0);
++    if (!s->qf) {
++        av_log(ctx, AV_LOG_ERROR, "Device has no compute queues\n");
++        err = AVERROR(ENOTSUP);
++        goto fail;
++    }
++
++    RET(ff_vk_exec_pool_init(vkctx, s->qf, &s->e, FF_VK_DEFAULT_EXEC_CONTEXTS, 0, 0, 0, NULL));
++
++    SPEC_LIST_CREATE(sl, 3, 3*sizeof(uint32_t))
++    SPEC_LIST_ADD(sl, 0, 32, inlink->w);
++    SPEC_LIST_ADD(sl, 1, 32, inlink->h);
++    SPEC_LIST_ADD(sl, 2, 32, pixdesc->comp[0].shift);
++
++    ff_vk_shader_load(&s->shd, VK_SHADER_STAGE_COMPUTE_BIT, sl,
++                      (int []) { 32, 32, 1 }, 0);
++
++    const FFVulkanDescriptorSetBinding desc[] = {
++        { /* input_img */
++            .type       = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
++            .stages     = VK_SHADER_STAGE_COMPUTE_BIT,
++            .elems      = av_pix_fmt_count_planes(s->vkctx.input_format),
++        },
++        { /* sum_buffer */
++            .type        = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
++            .stages      = VK_SHADER_STAGE_COMPUTE_BIT,
++        }
++    };
++    ff_vk_shader_add_descriptor_set(vkctx, &s->shd, desc, 2, 0);
++
++    RET(ff_vk_shader_link(vkctx, &s->shd,
++                          ff_cropdetect_comp_spv_data,
++                          ff_cropdetect_comp_spv_len, "main"));
++
++    RET(ff_vk_shader_register_exec(vkctx, &s->e, &s->shd));
++
++    s->initialized = 1;
++
++fail:
++    return err;
++}
++
++#define SET_META(key, value) \
++    av_dict_set_int(metadata, key, value, 0)
++
++static void evaluate(AVFilterLink *inlink, AVFrame *frame,
++                     const uint32_t *line_sum)
++{
++    AVFilterContext *ctx = inlink->dst;
++    CropDetectVulkanContext *s = ctx->priv;
++    int w, h, x, y, shrink_by;
++    AVDictionary **metadata = &frame->metadata;
++    int outliers, last_y;
++    int limit_upscaled = lrint(s->limit_upscaled);
++    char limit_str[22];
++
++    const int inw = inlink->w;
++    const int inh = inlink->h;
++    const uint32_t *row_sum = line_sum;
++    const uint32_t *col_sum = line_sum + inh;
++
++    /* Reset the crop area every reset_count frames, if reset_count is > 0 */
++    if (s->reset_count > 0 && s->frame_nb > s->reset_count) {
++        s->x1 = inw - 1;
++        s->y1 = inh - 1;
++        s->x2 = 0;
++        s->y2 = 0;
++        s->frame_nb = 1;
++    }
++
++#define FIND(DST, FROM, NOEND, INC, SUM, LEN) \
++    outliers = 0;\
++    for (last_y = y = FROM; NOEND; y = y INC) {\
++        if ((int)(SUM[y] / LEN) > limit_upscaled) {\
++            if (++outliers > s->max_outliers) { \
++                DST = last_y;\
++                break;\
++            }\
++        } else\
++            last_y = y INC;\
++    }
++
++    FIND(s->y1,       0,               y < s->y1, +1, row_sum, inw);
++    FIND(s->y2, inh - 1, y > FFMAX(s->y2, s->y1), -1, row_sum, inw);
++    FIND(s->x1,       0,               y < s->x1, +1, col_sum, inh);
++    FIND(s->x2, inw - 1, y > FFMAX(s->x2, s->x1), -1, col_sum, inh);
++
++    /* round x and y (up), important for yuv colorspaces
++     * make sure they stay rounded! */
++    x = (s->x1+1) & ~1;
++    y = (s->y1+1) & ~1;
++
++    w = s->x2 - x + 1;
++    h = s->y2 - y + 1;
++
++    /* w and h must be divisible by 2 as well because of yuv
++     * colorspace problems. */
++    if (s->round <= 1)
++        s->round = 16;
++    if (s->round % 2)
++        s->round *= 2;
++
++    shrink_by = w % s->round;
++    w -= shrink_by;
++    x += (shrink_by/2 + 1) & ~1;
++
++    shrink_by = h % s->round;
++    h -= shrink_by;
++    y += (shrink_by/2 + 1) & ~1;
++
++    SET_META("lavfi.cropdetect.x1", s->x1);
++    SET_META("lavfi.cropdetect.x2", s->x2);
++    SET_META("lavfi.cropdetect.y1", s->y1);
++    SET_META("lavfi.cropdetect.y2", s->y2);
++    SET_META("lavfi.cropdetect.w",  w);
++    SET_META("lavfi.cropdetect.h",  h);
++    SET_META("lavfi.cropdetect.x",  x);
++    SET_META("lavfi.cropdetect.y",  y);
++
++    snprintf(limit_str, sizeof(limit_str), "%f", s->limit);
++    av_dict_set(metadata, "lavfi.cropdetect.limit", limit_str, 0);
++
++    av_log(ctx, AV_LOG_INFO,
++           "x1:%d x2:%d y1:%d y2:%d w:%d h:%d x:%d y:%d pts:%"PRId64" t:%f limit:%f crop=%d:%d:%d:%d\n",
++           s->x1, s->x2, s->y1, s->y2, w, h, x, y, frame->pts,
++           frame->pts == AV_NOPTS_VALUE ? -1 : frame->pts * av_q2d(inlink->time_base),
++           s->limit, w, h, x, y);
++}
++
++static int cropdetect_vulkan_filter_frame(AVFilterLink *link, AVFrame *in)
++{
++    int err;
++    AVFilterContext *ctx = link->dst;
++    CropDetectVulkanContext *s = ctx->priv;
++    AVFilterLink *outlink = ctx->outputs[0];
++
++    VkImageView in_views[AV_NUM_DATA_POINTERS];
++    VkImageMemoryBarrier2 img_bar[4];
++    int nb_img_bar = 0;
++
++    FFVulkanContext *vkctx = &s->vkctx;
++    FFVulkanFunctions *vk = &vkctx->vkfn;
++    FFVkExecContext *exec = NULL;
++    FFVkBuffer *sum_vk = NULL;
++
++    /* ignore first s->skip frames */
++    if (++s->frame_nb <= 0)
++        return ff_filter_frame(outlink, in);
++
++    if (!s->initialized)
++        RET(init_filter(ctx));
++
++    RET(ff_vk_get_pooled_buffer(vkctx, &s->sum_buf_pool, &sum_vk,
++                                VK_BUFFER_USAGE_TRANSFER_DST_BIT |
++                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
++                                NULL,
++                                (link->w + link->h) * sizeof(uint32_t),
++                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
++                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
++
++    exec = ff_vk_exec_get(vkctx, &s->e);
++    err = ff_vk_exec_start(vkctx, exec);
++    if (err < 0) {
++        av_frame_free(&in);
++        av_refstruct_unref(&sum_vk);
++        return err;
++    }
++
++    RET(ff_vk_exec_add_dep_frame(vkctx, exec, in,
++                                 VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++                                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT));
++    RET(ff_vk_create_imageviews(vkctx, exec, in_views, in, FF_VK_REP_UINT));
++
++    ff_vk_shader_update_img_array(vkctx, exec, &s->shd, in, in_views, 0, 0,
++                                  VK_IMAGE_LAYOUT_GENERAL, VK_NULL_HANDLE);
++
++    ff_vk_frame_barrier(vkctx, exec, in, img_bar, &nb_img_bar,
++                        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
++                        VK_ACCESS_SHADER_READ_BIT,
++                        VK_IMAGE_LAYOUT_GENERAL,
++                        VK_QUEUE_FAMILY_IGNORED);
++
++    /* zero sum buffer */
++    vk->CmdPipelineBarrier2(exec->buf, &(VkDependencyInfo) {
++            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
++            .pBufferMemoryBarriers = &(VkBufferMemoryBarrier2) {
++                .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
++                .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
++                .dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
++                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .buffer = sum_vk->buf,
++                .size = sum_vk->size,
++                .offset = 0,
++            },
++            .bufferMemoryBarrierCount = 1,
++        });
++
++    vk->CmdFillBuffer(exec->buf, sum_vk->buf, 0, sum_vk->size, 0x0);
++
++    vk->CmdPipelineBarrier2(exec->buf, &(VkDependencyInfo) {
++            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
++            .pImageMemoryBarriers = img_bar,
++            .imageMemoryBarrierCount = nb_img_bar,
++            .pBufferMemoryBarriers = &(VkBufferMemoryBarrier2) {
++                .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
++                .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
++                .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
++                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++                .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
++                                 VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
++                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .buffer = sum_vk->buf,
++                .size = sum_vk->size,
++                .offset = 0,
++            },
++            .bufferMemoryBarrierCount = 1,
++        });
++
++    RET(ff_vk_shader_update_desc_buffer(&s->vkctx, exec, &s->shd, 0, 1, 0,
++                                        sum_vk, 0, sum_vk->size,
++                                        VK_FORMAT_UNDEFINED));
++
++    ff_vk_exec_bind_shader(vkctx, exec, &s->shd);
++
++    vk->CmdDispatch(exec->buf,
++                    FFALIGN(in->width,  s->shd.lg_size[0]) / s->shd.lg_size[0],
++                    FFALIGN(in->height, s->shd.lg_size[1]) / s->shd.lg_size[1],
++                    s->shd.lg_size[2]);
++
++    vk->CmdPipelineBarrier2(exec->buf, &(VkDependencyInfo) {
++            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
++            .pBufferMemoryBarriers = &(VkBufferMemoryBarrier2) {
++                .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
++                .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
++                .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
++                .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
++                                 VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
++                .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
++                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .buffer = sum_vk->buf,
++                .size = sum_vk->size,
++                .offset = 0,
++            },
++            .bufferMemoryBarrierCount = 1,
++        });
++
++    err = ff_vk_exec_submit(vkctx, exec);
++    if (err < 0) {
++        av_frame_free(&in);
++        av_refstruct_unref(&sum_vk);
++        return err;
++    }
++    ff_vk_exec_wait(vkctx, exec);
++    evaluate(link, in, (const uint32_t *) sum_vk->mapped_mem);
++
++    av_refstruct_unref(&sum_vk);
++    return ff_filter_frame(outlink, in);
++
++fail:
++    if (exec)
++        ff_vk_exec_discard(&s->vkctx, exec);
++    av_frame_free(&in);
++    av_refstruct_unref(&sum_vk);
++    return err;
++}
++
++static av_cold int cropdetect_vulkan_init(AVFilterContext *ctx)
++{
++    CropDetectVulkanContext *s = ctx->priv;
++
++    s->frame_nb = -1 * s->skip;
++
++    av_log(ctx, AV_LOG_VERBOSE, "limit:%f round:%d skip:%d reset_count:%d\n",
++           s->limit, s->round, s->skip, s->reset_count);
++
++    return ff_vk_filter_init(ctx);
++}
++
++static void cropdetect_vulkan_uninit(AVFilterContext *avctx)
++{
++    CropDetectVulkanContext *s = avctx->priv;
++    FFVulkanContext *vkctx = &s->vkctx;
++
++    ff_vk_exec_pool_free(vkctx, &s->e);
++    ff_vk_shader_free(vkctx, &s->shd);
++
++    av_refstruct_pool_uninit(&s->sum_buf_pool);
++
++    ff_vk_uninit(&s->vkctx);
++
++    s->initialized = 0;
++}
++
++static int config_output(AVFilterLink *outlink)
++{
++    AVFilterContext *ctx = outlink->src;
++    CropDetectVulkanContext *s = ctx->priv;
++    FFVulkanContext *vkctx = &s->vkctx;
++    const AVFilterLink *inlink = ctx->inputs[0];
++    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(vkctx->input_format);
++
++    if (desc->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_XYZ |
++                       AV_PIX_FMT_FLAG_FLOAT) ||
++        !(desc->flags & AV_PIX_FMT_FLAG_PLANAR)) {
++        av_log(ctx, AV_LOG_ERROR, "Input format %s is not planar YUV\n",
++               av_get_pix_fmt_name(vkctx->input_format));
++        return AVERROR(EINVAL);
++    }
++
++    s->bitdepth = desc->comp[0].depth;
++
++    if (s->limit < 1.0)
++        s->limit_upscaled = s->limit * ((1 << s->bitdepth) - 1);
++    else
++        s->limit_upscaled = s->limit;
++
++    s->x1 = inlink->w - 1;
++    s->y1 = inlink->h - 1;
++    s->x2 = 0;
++    s->y2 = 0;
++
++    return ff_vk_filter_config_output(outlink);
++}
++
++static int process_command(AVFilterContext *ctx, const char *cmd, const char *args,
++                           char *res, int res_len, int flags)
++{
++    CropDetectVulkanContext *s = ctx->priv;
++    float old_limit = s->limit;
++    int ret;
++
++    if ((ret = ff_filter_process_command(ctx, cmd, args, res, res_len, flags)) < 0)
++        return ret;
++
++    if (old_limit != s->limit) {
++        if (s->limit < 1.0)
++            s->limit_upscaled = s->limit * ((1 << s->bitdepth) - 1);
++        else
++            s->limit_upscaled = s->limit;
++        s->frame_nb = s->reset_count;
++    }
++
++    return 0;
++}
++
++#define OFFSET(x) offsetof(CropDetectVulkanContext, x)
++#define FLAGS (AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_VIDEO_PARAM)
++#define TFLAGS (FLAGS | AV_OPT_FLAG_RUNTIME_PARAM)
++static const AVOption cropdetect_vulkan_options[] = {
++    { "limit", "Threshold below which the pixel is considered black", OFFSET(limit),       AV_OPT_TYPE_FLOAT, { .dbl = 24.0/255 }, 0, 65535, TFLAGS },
++    { "round", "Value by which the width/height should be divisible", OFFSET(round),       AV_OPT_TYPE_INT, { .i64 = 16 }, 0, INT_MAX, FLAGS },
++    { "reset", "Recalculate the crop area after this many frames",    OFFSET(reset_count), AV_OPT_TYPE_INT, { .i64 = 0 },  0, INT_MAX, FLAGS },
++    { "skip",  "Number of initial frames to skip",                    OFFSET(skip),        AV_OPT_TYPE_INT, { .i64 = 2 },  0, INT_MAX, FLAGS },
++    { "reset_count", "Recalculate the crop area after this many frames",OFFSET(reset_count),AV_OPT_TYPE_INT,{ .i64 = 0 },  0, INT_MAX, FLAGS },
++    { "max_outliers", "Threshold count of outliers",                  OFFSET(max_outliers),AV_OPT_TYPE_INT, { .i64 = 0 },  0, INT_MAX, FLAGS },
++    { NULL }
++};
++
++AVFILTER_DEFINE_CLASS(cropdetect_vulkan);
++
++static const AVFilterPad cropdetect_vulkan_inputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .filter_frame = &cropdetect_vulkan_filter_frame,
++        .config_props = &ff_vk_filter_config_input,
++    },
++};
++
++static const AVFilterPad cropdetect_vulkan_outputs[] = {
++    {
++        .name = "default",
++        .type = AVMEDIA_TYPE_VIDEO,
++        .config_props = &config_output,
++    },
++};
++
++const FFFilter ff_vf_cropdetect_vulkan = {
++    .p.name         = "cropdetect_vulkan",
++    .p.description  = NULL_IF_CONFIG_SMALL("Auto-detect crop size."),
++    .p.priv_class   = &cropdetect_vulkan_class,
++    .p.flags        = AVFILTER_FLAG_HWDEVICE,
++    .priv_size      = sizeof(CropDetectVulkanContext),
++    .init           = &cropdetect_vulkan_init,
++    .uninit         = &cropdetect_vulkan_uninit,
++    FILTER_INPUTS(cropdetect_vulkan_inputs),
++    FILTER_OUTPUTS(cropdetect_vulkan_outputs),
++    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_VULKAN),
++    .process_command = &process_command,
++    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
++};
+diff --git a/libavfilter/vulkan/Makefile b/libavfilter/vulkan/Makefile
+index 55de033..c9fbdb2 100644
+--- a/libavfilter/vulkan/Makefile
++++ b/libavfilter/vulkan/Makefile
+@@ -7,6 +7,7 @@ OBJS-$(CONFIG_BLEND_VULKAN_FILTER) += vulkan/blend.comp.spv.o
+ OBJS-$(CONFIG_BWDIF_VULKAN_FILTER) += vulkan/bwdif.comp.spv.o
+ OBJS-$(CONFIG_CHROMABER_VULKAN_FILTER) += vulkan/chromaber.comp.spv.o
+ OBJS-$(CONFIG_COLOR_VULKAN_FILTER) += vulkan/color.comp.spv.o
++OBJS-$(CONFIG_CROPDETECT_VULKAN_FILTER) += vulkan/cropdetect.comp.spv.o
+ OBJS-$(CONFIG_GBLUR_VULKAN_FILTER) += vulkan/gblur.comp.spv.o
+ OBJS-$(CONFIG_SCALE_VULKAN_FILTER) += vulkan/scale.comp.spv.o \
+                                       vulkan/debayer.comp.spv.o
+diff --git a/libavfilter/vulkan/cropdetect.comp.glsl b/libavfilter/vulkan/cropdetect.comp.glsl
+new file mode 100644
+index 0000000..715f7f6
+--- /dev/null
++++ b/libavfilter/vulkan/cropdetect.comp.glsl
+@@ -0,0 +1,58 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with FFmpeg; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#pragma shader_stage(compute)
++
++#extension GL_EXT_shader_image_load_formatted : require
++#extension GL_EXT_scalar_block_layout : require
++#extension GL_EXT_nonuniform_qualifier : require
++#extension GL_EXT_null_initializer : require
++
++layout (constant_id = 0) const uint width = 0;
++layout (constant_id = 1) const uint height = 0;
++layout (constant_id = 2) const uint shift = 0;
++
++layout (local_size_x_id = 253, local_size_y_id = 254, local_size_z_id = 255) in;
++
++layout (set = 0, binding = 0) uniform readonly uimage2D input_img[];
++layout (set = 0, binding = 1, scalar) buffer sum_buffer {
++    uint line_sum[]; /* height row sums, followed by width column sums */
++};
++
++shared uint wg_row_sum[gl_WorkGroupSize.y] = { };
++shared uint wg_col_sum[gl_WorkGroupSize.x] = { };
++
++void main()
++{
++    const uvec2 pos = gl_GlobalInvocationID.xy;
++
++    /* oob invocs still must reach the barrier, but mustn't get summed up;
++     * the image may be larger than the frame, so the frame size bounds too */
++    const uvec2 size = min(uvec2(imageSize(input_img[0])), uvec2(width, height));
++    if (all(lessThan(pos, size))) {
++        uint value = imageLoad(input_img[0], ivec2(pos)).x >> shift;
++        atomicAdd(wg_row_sum[gl_LocalInvocationID.y], value);
++        atomicAdd(wg_col_sum[gl_LocalInvocationID.x], value);
++    }
++
++    barrier();
++    if (gl_LocalInvocationID.x == 0 && pos.y < height)
++        atomicAdd(line_sum[pos.y], wg_row_sum[gl_LocalInvocationID.y]);
++    if (gl_LocalInvocationID.y == 0 && pos.x < width)
++        atomicAdd(line_sum[height + pos.x], wg_col_sum[gl_LocalInvocationID.x]);
++}
+-- 
+2.53.0
+
