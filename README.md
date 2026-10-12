@@ -124,9 +124,12 @@ time.
 ## mpv script
 
 `script/toggle_autocrop.lua` inserts `cropdetect_vulkan` and applies the
-detected area through `video-crop`. It needs `--gpu-api=vulkan`; with
-`--hwdec=vulkan` the frames are read in place, with other decoders they are
-uploaded first.
+detected area through `video-crop`. It needs `--gpu-api=vulkan`.
+
+**The filter reads the frames on the GPU**: with `--hwdec=vulkan` they are read
+in place, and with `--hwdec=nvdec`, `nvdec-copy` or `no` they are uploaded to
+Vulkan first. A copy-back decoder (`--hwdec=vulkan-copy` or `nvdec-copy`) is
+not needed for crop detection.
 
 ```
 KEY script-message toggle_autocrop
