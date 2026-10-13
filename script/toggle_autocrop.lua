@@ -50,7 +50,7 @@ end
 
 set_active(false)
 
-local function is_vulkan_api()
+local function is_vulkan_context()
     local gpu_context = mp.get_property("current-gpu-context")
     return gpu_context ~= nil and gpu_context:sub(-#VULKAN_CONTEXT_SUFFIX) == VULKAN_CONTEXT_SUFFIX
 end
@@ -260,7 +260,7 @@ local function handle_toggle(command, suppress_osd)
         return
     end
 
-    if enable and not is_vulkan_api() then
+    if enable and not is_vulkan_context() then
         msg.warn("Limit: gpu-api is not vulkan")
         return
     end
