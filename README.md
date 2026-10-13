@@ -22,7 +22,7 @@ values: for the same frames both filters report the same numbers.
   and per column, and only these sums are read back.
 - Only the `black` mode is implemented. The options `mode`, `mv_threshold`,
   `low` and `high` do not exist.
-- The timeline option `enable` is not supported.
+- FFmpeg's timeline editing (`enable`) is not supported.
 
 ### Supported input
 
