@@ -8,16 +8,13 @@ for FFmpeg, and an mpv script that uses it to crop black bars during playback.
 Auto-detect the crop size on Vulkan frames.
 
 It calculates the necessary cropping parameters and prints the recommended
-parameters via the logging system and the frame metadata. The detected
-dimensions correspond to the non-black area of the input video. The frames
-are passed on unchanged.
+parameters via the logging system. The detected dimensions correspond to the
+non-black area of the input video. The frames are passed on unchanged.
 
-The metadata keys (`lavfi.cropdetect.x1`, `x2`, `y1`, `y2`, `w`, `h`, `x`,
-`y`, `limit`) and the log line are those of `cropdetect`, and so are the
-values: for the same frames both filters report the same numbers.
+### Compared with cropdetect
 
-### Differences from cropdetect
-
+- The metadata keys (`lavfi.cropdetect.x1`, `x2`, `y1`, `y2`, `w`, `h`, `x`,
+  `y`, `limit`), the log line and the values are those of `cropdetect`.
 - The frames stay on the GPU. A compute shader sums the luma plane per row
   and per column, and only these sums are read back.
 - Only the `black` mode is implemented. The options `mode`, `mv_threshold`,
@@ -26,11 +23,10 @@ values: for the same frames both filters report the same numbers.
 
 ### Supported input
 
-- Vulkan hardware frames only. Frames of a Vulkan decoder are read in place;
-  other frames have to be uploaded first, with `hwupload` in FFmpeg or
-  `format=fmt=vulkan` in mpv.
+- Vulkan hardware frames only. Other frames have to be uploaded first, with
+  `hwupload` in FFmpeg or `format=fmt=vulkan` in mpv.
 - Planar and semi-planar YUV formats with 8 to 16 bits, such as `nv12`,
-  `p010`, `p012`, `p016` and `yuv420p10`. Only the luma plane is examined.
+  `p010`, `p012`, `p016` and `yuv420p10`.
 - RGB, XYZ, packed and floating-point formats are rejected.
 
 As with the other Vulkan filters, a hardware device has to be initialized and
@@ -92,12 +88,6 @@ It accepts the following parameters:
   ffmpeg -init_hw_device vulkan=vk -filter_hw_device vk -i file.mkv -vf hwupload,cropdetect_vulkan,metadata=mode=print -f null -
   ```
 
-- Print the detected area in mpv:
-
-  ```
-  mpv --vo=gpu-next --gpu-api=vulkan --hwdec=vulkan --vf=lavfi=[cropdetect_vulkan] -v file.mkv
-  ```
-
 ### Commands
 
 This filter supports the following commands:
@@ -121,18 +111,39 @@ Then configure FFmpeg with `--enable-gpl` and `--enable-vulkan`, and have a
 SPIR-V compiler (`glslc`, `glslang` or `glslangValidator`) available at build
 time.
 
+Patched binaries are at [sohnyj/mpv-winbuild](https://github.com/sohnyj/mpv-winbuild).
+
 ## mpv script
 
 `script/toggle_autocrop.lua` inserts `cropdetect_vulkan` and applies the
-detected area through `video-crop`. It needs `--gpu-api=vulkan`.
+detected area through `video-crop`.
 
-**The filter reads the frames on the GPU**: with `--hwdec=vulkan` they are read
-in place, and with `--hwdec=nvdec`, `nvdec-copy` or `no` they are uploaded to
-Vulkan first. A copy-back decoder (`--hwdec=vulkan-copy` or `nvdec-copy`) is
-not needed for crop detection.
+### Usage
+
+`mpv.conf`:
+
+```
+gpu-context=winvk # or waylandvk; only winvk is tested
+gpu-api=vulkan
+vo=gpu-next
+hwdec=vulkan
+```
+
+This is the optimal setup: **the filter reads the frames on the GPU, so they
+are not copied**, and no copy-back decoder is needed for crop detection.
+`gpu-api=vulkan` is required. With `hwdec=nvdec`, `nvdec-copy` or `no` the
+frames are uploaded to Vulkan first.
+
+`input.conf`:
 
 ```
 KEY script-message toggle_autocrop
 ```
 
 `script/toggle_autocrop.conf` is an example for `script-opts`.
+
+To print the detected area without the script:
+
+```
+mpv --vo=gpu-next --gpu-api=vulkan --hwdec=vulkan --vf=lavfi=[cropdetect_vulkan] -v file.mkv
+```
