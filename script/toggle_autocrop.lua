@@ -58,7 +58,7 @@ end
 local function get_video_fps()
     local fps = mp.get_property_native("container-fps")
     if not fps then
-        msg.warn("Limit: no video")
+        msg.warn("Limit: no fps")
         return nil
     end
     return fps
@@ -261,7 +261,7 @@ local function handle_toggle(command, suppress_osd)
     end
 
     if enable and not is_vulkan_context() then
-        msg.warn("Limit: gpu-api is not vulkan")
+        msg.warn("Limit: gpu-context is not vulkan")
         return
     end
 
