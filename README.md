@@ -129,15 +129,20 @@ vo=gpu-next
 hwdec=vulkan
 ```
 
-This is the optimal setup: **the filter reads the frames on the GPU, so they
-are not copied**, and no copy-back decoder is needed for crop detection.
-`gpu-api=vulkan` is required. With `hwdec=nvdec`, `nvdec-copy` or `no` the
-frames are uploaded to Vulkan first.
+`gpu-api=vulkan` is required. With `hwdec=vulkan`, as above, **the frames are
+read on the GPU without being copied**, and no copy-back decoder is needed.
+With `hwdec=nvdec`, `nvdec-copy` or `no`, they are uploaded to Vulkan first.
 
 `input.conf`:
 
 ```
 KEY script-message toggle_autocrop
+```
+
+`menu.conf`:
+
+```
+Autocrop	script-message toggle_autocrop	checked=p["user-data/filter/autocrop"]
 ```
 
 `script/toggle_autocrop.conf` is an example for `script-opts`.
