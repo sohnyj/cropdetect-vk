@@ -21,13 +21,8 @@ options.read_options(autocrop_opts)
 
 local FILTER_LABEL = "@" .. autocrop_opts.label
 local UPLOAD_LABEL = "@" .. autocrop_opts.label .. "_upload"
-local UPLOAD_COMMAND = "%s:format=fmt=vulkan" -- uploads CUDA and software frames to Vulkan
-local VULKAN_PIXELFORMAT = "vulkan"
 local FILTER_COMMAND = "%s:cropdetect_vulkan=limit=%s:reset=%d:round=%d"
-local METADATA_PROPERTY = "vf-metadata/" .. autocrop_opts.label
-local METADATA_KEY_PREFIX = "lavfi.cropdetect."
-local VULKAN_CONTEXT_SUFFIX = "vk"
-local USERDATA_PROPERTY = "user-data/filter/" .. autocrop_opts.label
+local UPLOAD_COMMAND = "%s:format=fmt=vulkan" -- uploads CUDA and software frames to Vulkan
 local POLL_FRAMES = 10 -- video frames between cropdetect metadata polls
 local POLL_INTERVAL_RESOLUTION = 10 -- poll interval rounding steps per second
 local RESET_MARGIN_FRAMES = 2 -- frames by which the cropdetect reset window is shorter than the poll interval
@@ -45,14 +40,14 @@ local autocrop_state = {
 
 local function set_active(active)
     autocrop_state.active = active
-    mp.set_property_native(USERDATA_PROPERTY, active)
+    mp.set_property_native("user-data/filter/" .. autocrop_opts.label, active)
 end
 
 set_active(false)
 
 local function is_vulkan_context()
     local gpu_context = mp.get_property("current-gpu-context")
-    return gpu_context ~= nil and gpu_context:sub(-#VULKAN_CONTEXT_SUFFIX) == VULKAN_CONTEXT_SUFFIX
+    return gpu_context ~= nil and gpu_context:sub(-#"vk") == "vk"
 end
 
 local function get_video_fps()
@@ -70,7 +65,7 @@ local function get_poll_interval(fps)
 end
 
 local function needs_upload()
-    return mp.get_property("video-params/pixelformat") ~= VULKAN_PIXELFORMAT
+    return mp.get_property("video-params/pixelformat") ~= "vulkan"
 end
 
 local function is_filter_active(label)
@@ -137,17 +132,17 @@ local function debounce_autocrop(crop, max_w, max_h)
 end
 
 local function update_autocrop()
-    local cropdetect_metadata = mp.get_property_native(METADATA_PROPERTY)
+    local cropdetect_metadata = mp.get_property_native("vf-metadata/" .. autocrop_opts.label)
     if not cropdetect_metadata then return end
 
     local max_w = mp.get_property_native("video-out-params/w")
     local max_h = mp.get_property_native("video-out-params/h")
     if not max_w or not max_h then return end
 
-    local w = tonumber(cropdetect_metadata[METADATA_KEY_PREFIX .. "w"])
-    local h = tonumber(cropdetect_metadata[METADATA_KEY_PREFIX .. "h"])
-    local x = tonumber(cropdetect_metadata[METADATA_KEY_PREFIX .. "x"])
-    local y = tonumber(cropdetect_metadata[METADATA_KEY_PREFIX .. "y"])
+    local w = tonumber(cropdetect_metadata["lavfi.cropdetect.w"])
+    local h = tonumber(cropdetect_metadata["lavfi.cropdetect.h"])
+    local x = tonumber(cropdetect_metadata["lavfi.cropdetect.x"])
+    local y = tonumber(cropdetect_metadata["lavfi.cropdetect.y"])
     if not (w and h and x and y) then return end
 
     local crop = {}
