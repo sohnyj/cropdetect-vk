@@ -118,6 +118,9 @@ Patched binaries are at [sohnyj/mpv-winbuild](https://github.com/sohnyj/mpv-winb
 `script/toggle_autocrop.lua` inserts `cropdetect_vulkan` and applies the
 detected area through `video-crop`.
 
+It applies a dynamic crop that follows aspect ratio changes during playback,
+such as those of IMAX films.
+
 ### Usage
 
 `mpv.conf`:
