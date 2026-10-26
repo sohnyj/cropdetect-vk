@@ -21,21 +21,18 @@ options.read_options(autocrop_opts)
 
 local FILTER_LABEL = "@" .. autocrop_opts.label
 local UPLOAD_LABEL = "@" .. autocrop_opts.label .. "_upload"
-local FILTER_COMMAND = "%s:cropdetect_vulkan=limit=%s:reset=%d:round=%d"
+local FILTER_COMMAND = "%s:cropdetect_vulkan=limit=%s:reset=1:round=%d" -- reset=1 detects each frame on its own
 local UPLOAD_COMMAND = "%s:format=fmt=vulkan" -- uploads CUDA and software frames to Vulkan
-local POLL_FRAMES = 10 -- video frames between cropdetect metadata polls
-local POLL_INTERVAL_RESOLUTION = 10 -- poll interval rounding steps per second
-local RESET_MARGIN_FRAMES = 2 -- frames by which the cropdetect reset window is shorter than the poll interval
-local MIN_RESET_FRAMES = 1 -- cropdetect reset=0 means never reset
-local DEBOUNCE_POLLS = 2 -- poll intervals a detected crop must stay unchanged before it is applied
+local DEBOUNCE_SECONDS = 0.3 -- time a detected crop must stay unchanged before it is applied
 local MAX_DETECT_SPEED = 1 -- playback speed above which detection is skipped
 
 local autocrop_state = {
     active = false,
-    poll_timer = nil,
-    debounce_sec = 0,
-    properties = { speed = 1, seeking = false },
-    pending = {},
+    properties = { speed = 1, seeking = false, pause = false },
+    metadata = nil, -- latest cropdetect metadata
+    applied = nil, -- crop in effect
+    pending = nil, -- detected crop that is applied when the debounce timer expires
+    debounce_timer = nil,
 }
 
 local function set_active(active)
@@ -48,20 +45,6 @@ set_active(false)
 local function is_vulkan_context()
     local gpu_context = mp.get_property("current-gpu-context")
     return gpu_context ~= nil and gpu_context:sub(-#"vk") == "vk"
-end
-
-local function get_video_fps()
-    local fps = mp.get_property_native("container-fps")
-    if not fps then
-        msg.warn("Limit: no fps")
-        return nil
-    end
-    return fps
-end
-
-local function get_poll_interval(fps)
-    return math.max(math.floor(POLL_FRAMES / fps * POLL_INTERVAL_RESOLUTION + 0.5) / POLL_INTERVAL_RESOLUTION,
-        1 / POLL_INTERVAL_RESOLUTION)
 end
 
 local function needs_upload()
@@ -77,17 +60,16 @@ local function is_filter_active(label)
     return false
 end
 
-local function insert_autocrop(fps, poll_interval)
+local function insert_autocrop()
     if is_filter_active(FILTER_LABEL) then
         return
     end
 
-    local reset_frames = math.max(math.floor(poll_interval * fps + 0.5) - RESET_MARGIN_FRAMES, MIN_RESET_FRAMES)
     if needs_upload() then
         mp.commandv("vf", "append", string.format(UPLOAD_COMMAND, UPLOAD_LABEL))
     end
     mp.commandv("vf", "append", string.format(FILTER_COMMAND,
-        FILTER_LABEL, autocrop_opts.cropdetect_limit, reset_frames, autocrop_opts.cropdetect_round))
+        FILTER_LABEL, autocrop_opts.cropdetect_limit, autocrop_opts.cropdetect_round))
 end
 
 local function clamp_autocrop(crop_size, crop_pos, min_size, max_size)
@@ -106,81 +88,108 @@ local function clamp_autocrop(crop_size, crop_pos, min_size, max_size)
     return crop_size, crop_pos
 end
 
-local function is_same_crop(crop, other, max_w, max_h)
-    local tolerance_w = max_w * autocrop_opts.crop_tolerance
-    local tolerance_h = max_h * autocrop_opts.crop_tolerance
+local function is_same_crop(crop, other)
+    local tolerance_w = crop.max_w * autocrop_opts.crop_tolerance
+    local tolerance_h = crop.max_h * autocrop_opts.crop_tolerance
     return math.abs(crop.w - other.w) <= tolerance_w and math.abs(crop.x - other.x) <= tolerance_w
         and math.abs(crop.h - other.h) <= tolerance_h and math.abs(crop.y - other.y) <= tolerance_h
 end
 
-local function apply_autocrop(crop, max_w, max_h)
-    if crop.w == max_w and crop.h == max_h then
+local function apply_autocrop(crop)
+    if crop.w == crop.max_w and crop.h == crop.max_h then
         mp.set_property("video-crop", "")
     else
         mp.set_property("video-crop", string.format("%dx%d+%d+%d", crop.w, crop.h, crop.x, crop.y))
     end
 end
 
-local function debounce_autocrop(crop, max_w, max_h)
-    local pending = autocrop_state.pending
-    if not pending.crop or not is_same_crop(crop, pending.crop, max_w, max_h) then
-        autocrop_state.pending = { crop = crop, time = mp.get_time(), applied = false }
-    elseif not pending.applied and mp.get_time() - pending.time >= autocrop_state.debounce_sec then
-        pending.applied = true
-        apply_autocrop(pending.crop, max_w, max_h)
+local function apply_pending_autocrop()
+    autocrop_state.applied = autocrop_state.pending
+    autocrop_state.pending = nil
+    apply_autocrop(autocrop_state.applied)
+end
+
+local function cancel_pending_autocrop()
+    autocrop_state.pending = nil
+    if autocrop_state.debounce_timer then
+        autocrop_state.debounce_timer:kill()
     end
 end
 
-local function update_autocrop()
-    local cropdetect_metadata = mp.get_property_native("vf-metadata/" .. autocrop_opts.label)
-    if not cropdetect_metadata then return end
+-- Applies a detected crop once it has not changed for DEBOUNCE_SECONDS.
+local function debounce_autocrop(crop)
+    local state = autocrop_state
+    if state.applied and is_same_crop(crop, state.applied) then
+        cancel_pending_autocrop()
+    elseif not state.pending or not is_same_crop(crop, state.pending) then
+        state.pending = crop
+        state.debounce_timer:kill()
+        if not state.properties.pause then
+            state.debounce_timer:resume()
+        end
+    end
+end
 
+local function get_detected_crop(cropdetect_metadata)
     local max_w = mp.get_property_native("video-out-params/w")
     local max_h = mp.get_property_native("video-out-params/h")
-    if not max_w or not max_h then return end
+    if not max_w or not max_h then return nil end
 
     local w = tonumber(cropdetect_metadata["lavfi.cropdetect.w"])
     local h = tonumber(cropdetect_metadata["lavfi.cropdetect.h"])
     local x = tonumber(cropdetect_metadata["lavfi.cropdetect.x"])
     local y = tonumber(cropdetect_metadata["lavfi.cropdetect.y"])
-    if not (w and h and x and y) then return end
+    if not (w and h and x and y) then return nil end
 
-    local crop = {}
+    local crop = { max_w = max_w, max_h = max_h }
     crop.w, crop.x = clamp_autocrop(w, x, max_w * autocrop_opts.min_apply_width, max_w)
     crop.h, crop.y = clamp_autocrop(h, y, max_h * autocrop_opts.min_apply_height, max_h)
-    debounce_autocrop(crop, max_w, max_h)
+    return crop
 end
 
-local function limit_autocrop()
-    local properties = autocrop_state.properties
-    if properties.seeking or properties.speed > MAX_DETECT_SPEED then
+-- mpv notifies the metadata only when it changes, so the latest metadata is
+-- detected again when seeking ends or the speed falls back.
+local function update_autocrop()
+    local state = autocrop_state
+    if not state.metadata or state.properties.seeking or state.properties.speed > MAX_DETECT_SPEED then
         return
     end
-    update_autocrop()
+
+    local crop = get_detected_crop(state.metadata)
+    if crop then
+        debounce_autocrop(crop)
+    end
 end
 
-local function reset_autocrop_state()
-    autocrop_state.pending = {}
+local function handle_metadata(_, cropdetect_metadata)
+    autocrop_state.metadata = cropdetect_metadata
+    update_autocrop()
 end
 
 local function handle_speed(_, value)
     autocrop_state.properties.speed = value
+    if value > MAX_DETECT_SPEED then
+        cancel_pending_autocrop()
+    else
+        update_autocrop()
+    end
 end
 
 local function handle_seeking(_, value)
     autocrop_state.properties.seeking = value
-    if value then reset_autocrop_state() end
+    if value then
+        cancel_pending_autocrop()
+    else
+        update_autocrop()
+    end
 end
 
 local function handle_pause(_, value)
-    if not autocrop_state.poll_timer then
-        return
-    end
-
+    autocrop_state.properties.pause = value
     if value then
-        autocrop_state.poll_timer:kill()
-    else
-        autocrop_state.poll_timer:resume()
+        autocrop_state.debounce_timer:kill()
+    elseif autocrop_state.pending then
+        autocrop_state.debounce_timer:resume()
     end
 end
 
@@ -188,30 +197,29 @@ local function observe_properties()
     mp.observe_property("speed", "number", handle_speed)
     mp.observe_property("seeking", "bool", handle_seeking)
     mp.observe_property("pause", "bool", handle_pause)
+    mp.observe_property("vf-metadata/" .. autocrop_opts.label, "native", handle_metadata)
 end
 
 local function unobserve_properties()
+    mp.unobserve_property(handle_metadata)
     mp.unobserve_property(handle_speed)
     mp.unobserve_property(handle_seeking)
     mp.unobserve_property(handle_pause)
-    autocrop_state.properties = { speed = 1, seeking = false }
+    autocrop_state.properties = { speed = 1, seeking = false, pause = false }
 end
 
-local function start_autocrop(fps)
-    local poll_interval = get_poll_interval(fps)
-    autocrop_state.debounce_sec = poll_interval * DEBOUNCE_POLLS
-
-    insert_autocrop(fps, poll_interval)
-    autocrop_state.poll_timer = mp.add_periodic_timer(poll_interval, limit_autocrop)
+local function start_autocrop()
+    insert_autocrop()
+    autocrop_state.debounce_timer = mp.add_timeout(DEBOUNCE_SECONDS, apply_pending_autocrop, true)
     observe_properties()
 end
 
 local function cleanup_autocrop()
     unobserve_properties()
-    if autocrop_state.poll_timer then
-        autocrop_state.poll_timer:kill()
-        autocrop_state.poll_timer = nil
-    end
+    cancel_pending_autocrop()
+    autocrop_state.debounce_timer = nil
+    autocrop_state.metadata = nil
+    autocrop_state.applied = nil
 
     if is_filter_active(FILTER_LABEL) then
         mp.commandv("vf", "remove", FILTER_LABEL)
@@ -220,16 +228,10 @@ local function cleanup_autocrop()
         mp.commandv("vf", "remove", UPLOAD_LABEL)
     end
     mp.set_property("video-crop", "")
-    reset_autocrop_state()
 end
 
 local function enable_autocrop(suppress_osd)
-    local fps = get_video_fps()
-    if not fps then
-        return
-    end
-
-    start_autocrop(fps)
+    start_autocrop()
     set_active(true)
     if not suppress_osd then
         mp.osd_message(autocrop_opts.osd .. ": yes")
