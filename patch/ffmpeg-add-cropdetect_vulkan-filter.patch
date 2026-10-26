@@ -1,4 +1,4 @@
-From 876e646fd12b81ae34ceb0cd7add3e785b707a45 Mon Sep 17 00:00:00 2001
+From 06b4e6019794104bb9e0272478fc0c37aa6abd86 Mon Sep 17 00:00:00 2001
 From: sohnyj <271139641+sohnyj@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 22:43:43 +0900
 Subject: [PATCH] avfilter: add cropdetect_vulkan filter
@@ -7,6 +7,10 @@ Vulkan port of the black mode of cropdetect. A compute shader sums up
 the luma plane per row and per column, and the borders are then searched
 on the CPU with the logic of vf_cropdetect.c, so that the metadata and
 the log output match those of the software filter.
+
+The sums are copied to host-cached memory, if the device has any, before
+the CPU reads them, as reads from device memory are uncached on discrete
+GPUs.
 
 The samples are read as integers and shifted down to their code values,
 and the sums are bounded by the frame size, as the images of hardware
@@ -18,18 +22,18 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  doc/filters.texi                        |   6 +-
  libavfilter/Makefile                    |   1 +
  libavfilter/allfilters.c                |   1 +
- libavfilter/vf_cropdetect_vulkan.c      | 458 ++++++++++++++++++++++++
+ libavfilter/vf_cropdetect_vulkan.c      | 500 ++++++++++++++++++++++++
  libavfilter/vulkan/Makefile             |   1 +
- libavfilter/vulkan/cropdetect.comp.glsl |  58 +++
- 7 files changed, 525 insertions(+), 1 deletion(-)
+ libavfilter/vulkan/cropdetect.comp.glsl |  72 ++++
+ 7 files changed, 581 insertions(+), 1 deletion(-)
  create mode 100644 libavfilter/vf_cropdetect_vulkan.c
  create mode 100644 libavfilter/vulkan/cropdetect.comp.glsl
 
 diff --git a/configure b/configure
-index f316113..c773a75 100755
+index 083bd652c4..39ce6b7201 100755
 --- a/configure
 +++ b/configure
-@@ -4149,6 +4149,7 @@ coreimagesrc_filter_deps="coreimage appkit"
+@@ -4148,6 +4148,7 @@ coreimagesrc_filter_deps="coreimage appkit"
  coreimagesrc_filter_extralibs="-framework OpenGL"
  cover_rect_filter_deps="avcodec avformat gpl"
  cropdetect_filter_deps="gpl"
@@ -38,10 +42,10 @@ index f316113..c773a75 100755
  deinterlace_qsv_filter_select="qsvvpp"
  deinterlace_vaapi_filter_deps="vaapi"
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 04496d3..099b0a4 100644
+index 37f9123df4..0807685f16 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
-@@ -11017,7 +11017,7 @@ If the specified expression is not valid, it is kept at its current
+@@ -11029,7 +11029,7 @@ If the specified expression is not valid, it is kept at its current
  value.
  @end table
  
@@ -50,7 +54,7 @@ index 04496d3..099b0a4 100644
  
  Auto-detect the crop size.
  
-@@ -11025,6 +11025,10 @@ It calculates the necessary cropping parameters and prints the
+@@ -11037,6 +11037,10 @@ It calculates the necessary cropping parameters and prints the
  recommended parameters via the logging system. The detected dimensions
  correspond to the non-black or video area of the input video according to @var{mode}.
  
@@ -62,10 +66,10 @@ index 04496d3..099b0a4 100644
  
  @table @option
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index 15d0b23..8a4c1eb 100644
+index ef2542b98b..7e2d9332de 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
-@@ -263,6 +263,7 @@ OBJS-$(CONFIG_CORR_FILTER)                   += vf_corr.o framesync.o
+@@ -265,6 +265,7 @@ OBJS-$(CONFIG_CORR_FILTER)                   += vf_corr.o framesync.o
  OBJS-$(CONFIG_COVER_RECT_FILTER)             += vf_cover_rect.o lavfutils.o
  OBJS-$(CONFIG_CROP_FILTER)                   += vf_crop.o
  OBJS-$(CONFIG_CROPDETECT_FILTER)             += vf_cropdetect.o edge_common.o
@@ -74,7 +78,7 @@ index 15d0b23..8a4c1eb 100644
  OBJS-$(CONFIG_CURVES_FILTER)                 += vf_curves.o
  OBJS-$(CONFIG_DATASCOPE_FILTER)              += vf_datascope.o
 diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
-index 931ac84..2437bec 100644
+index 931ac8481e..2437bec7e8 100644
 --- a/libavfilter/allfilters.c
 +++ b/libavfilter/allfilters.c
 @@ -239,6 +239,7 @@ extern const FFFilter ff_vf_corr;
@@ -87,10 +91,10 @@ index 931ac84..2437bec 100644
  extern const FFFilter ff_vf_datascope;
 diff --git a/libavfilter/vf_cropdetect_vulkan.c b/libavfilter/vf_cropdetect_vulkan.c
 new file mode 100644
-index 0000000..c26318b
+index 0000000000..e03937dccb
 --- /dev/null
 +++ b/libavfilter/vf_cropdetect_vulkan.c
-@@ -0,0 +1,458 @@
+@@ -0,0 +1,500 @@
 +/*
 + * This file is part of FFmpeg.
 + *
@@ -132,6 +136,7 @@ index 0000000..c26318b
 +    AVVulkanDeviceQueueFamily *qf;
 +    FFVulkanShader shd;
 +    AVRefStructPool *sum_buf_pool;
++    AVRefStructPool *read_buf_pool;
 +
 +    int x1, y1, x2, y2;
 +    float limit;
@@ -296,6 +301,8 @@ index 0000000..c26318b
 +    FFVulkanFunctions *vk = &vkctx->vkfn;
 +    FFVkExecContext *exec = NULL;
 +    FFVkBuffer *sum_vk = NULL;
++    FFVkBuffer *read_vk = NULL;
++    const size_t sum_size = (link->w + link->h) * sizeof(uint32_t);
 +
 +    /* ignore first s->skip frames */
 +    if (++s->frame_nb <= 0)
@@ -305,19 +312,26 @@ index 0000000..c26318b
 +        RET(init_filter(ctx));
 +
 +    RET(ff_vk_get_pooled_buffer(vkctx, &s->sum_buf_pool, &sum_vk,
++                                VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
 +                                VK_BUFFER_USAGE_TRANSFER_DST_BIT |
 +                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-+                                NULL,
-+                                (link->w + link->h) * sizeof(uint32_t),
-+                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
++                                NULL, sum_size,
++                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
++
++    /* The host reads the sums from a copy in cached memory, if the device
++     * has any, rather than from uncached device memory. */
++    RET(ff_vk_get_pooled_buffer(vkctx, &s->read_buf_pool, &read_vk,
++                                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++                                NULL, sum_size,
 +                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-+                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
++                                vkctx->host_cached_flag));
 +
 +    exec = ff_vk_exec_get(vkctx, &s->e);
 +    err = ff_vk_exec_start(vkctx, exec);
 +    if (err < 0) {
 +        av_frame_free(&in);
 +        av_refstruct_unref(&sum_vk);
++        av_refstruct_unref(&read_vk);
 +        return err;
 +    }
 +
@@ -391,10 +405,10 @@ index 0000000..c26318b
 +            .pBufferMemoryBarriers = &(VkBufferMemoryBarrier2) {
 +                .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
 +                .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-+                .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
++                .dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
 +                .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
 +                                 VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-+                .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
++                .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT,
 +                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 +                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 +                .buffer = sum_vk->buf,
@@ -404,16 +418,46 @@ index 0000000..c26318b
 +            .bufferMemoryBarrierCount = 1,
 +        });
 +
++    vk->CmdCopyBuffer(exec->buf, sum_vk->buf, read_vk->buf, 1, &(VkBufferCopy) {
++            .srcOffset = 0,
++            .dstOffset = 0,
++            .size = sum_size,
++        });
++
++    vk->CmdPipelineBarrier2(exec->buf, &(VkDependencyInfo) {
++            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
++            .pBufferMemoryBarriers = &(VkBufferMemoryBarrier2) {
++                .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
++                .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
++                .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
++                .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
++                .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT,
++                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .buffer = read_vk->buf,
++                .size = read_vk->size,
++                .offset = 0,
++            },
++            .bufferMemoryBarrierCount = 1,
++        });
++
 +    err = ff_vk_exec_submit(vkctx, exec);
++    if (err >= 0) {
++        ff_vk_exec_wait(vkctx, exec);
++        /* without HOST_COHERENT, the device writes become visible to the
++         * host once the memory is invalidated */
++        err = ff_vk_flush_buffer(vkctx, read_vk, 0, VK_WHOLE_SIZE, 0);
++    }
 +    if (err < 0) {
 +        av_frame_free(&in);
 +        av_refstruct_unref(&sum_vk);
++        av_refstruct_unref(&read_vk);
 +        return err;
 +    }
-+    ff_vk_exec_wait(vkctx, exec);
-+    evaluate(link, in, (const uint32_t *) sum_vk->mapped_mem);
++    evaluate(link, in, (const uint32_t *) read_vk->mapped_mem);
 +
 +    av_refstruct_unref(&sum_vk);
++    av_refstruct_unref(&read_vk);
 +    return ff_filter_frame(outlink, in);
 +
 +fail:
@@ -421,6 +465,7 @@ index 0000000..c26318b
 +        ff_vk_exec_discard(&s->vkctx, exec);
 +    av_frame_free(&in);
 +    av_refstruct_unref(&sum_vk);
++    av_refstruct_unref(&read_vk);
 +    return err;
 +}
 +
@@ -445,6 +490,7 @@ index 0000000..c26318b
 +    ff_vk_shader_free(vkctx, &s->shd);
 +
 +    av_refstruct_pool_uninit(&s->sum_buf_pool);
++    av_refstruct_pool_uninit(&s->read_buf_pool);
 +
 +    ff_vk_uninit(&s->vkctx);
 +
@@ -550,7 +596,7 @@ index 0000000..c26318b
 +    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 +};
 diff --git a/libavfilter/vulkan/Makefile b/libavfilter/vulkan/Makefile
-index 55de033..c9fbdb2 100644
+index 55de033d6b..c9fbdb2363 100644
 --- a/libavfilter/vulkan/Makefile
 +++ b/libavfilter/vulkan/Makefile
 @@ -7,6 +7,7 @@ OBJS-$(CONFIG_BLEND_VULKAN_FILTER) += vulkan/blend.comp.spv.o
@@ -563,10 +609,10 @@ index 55de033..c9fbdb2 100644
                                        vulkan/debayer.comp.spv.o
 diff --git a/libavfilter/vulkan/cropdetect.comp.glsl b/libavfilter/vulkan/cropdetect.comp.glsl
 new file mode 100644
-index 0000000..715f7f6
+index 0000000000..0bbbb9e885
 --- /dev/null
 +++ b/libavfilter/vulkan/cropdetect.comp.glsl
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,72 @@
 +/*
 + * This file is part of FFmpeg.
 + *
@@ -590,7 +636,6 @@ index 0000000..715f7f6
 +#extension GL_EXT_shader_image_load_formatted : require
 +#extension GL_EXT_scalar_block_layout : require
 +#extension GL_EXT_nonuniform_qualifier : require
-+#extension GL_EXT_null_initializer : require
 +
 +layout (constant_id = 0) const uint width = 0;
 +layout (constant_id = 1) const uint height = 0;
@@ -603,27 +648,42 @@ index 0000000..715f7f6
 +    uint line_sum[]; /* height row sums, followed by width column sums */
 +};
 +
-+shared uint wg_row_sum[gl_WorkGroupSize.y] = { };
-+shared uint wg_col_sum[gl_WorkGroupSize.x] = { };
++/* one more column than the workgroup, so that the row sums read the banks
++ * of different rows */
++shared uint tile[gl_WorkGroupSize.y][gl_WorkGroupSize.x + 1];
 +
 +void main()
 +{
 +    const uvec2 pos = gl_GlobalInvocationID.xy;
 +
-+    /* oob invocs still must reach the barrier, but mustn't get summed up;
-+     * the image may be larger than the frame, so the frame size bounds too */
++    /* oob invocs store 0, so that every tile entry is written before the
++     * barrier; the image may be larger than the frame, so the frame size
++     * bounds too */
 +    const uvec2 size = min(uvec2(imageSize(input_img[0])), uvec2(width, height));
-+    if (all(lessThan(pos, size))) {
-+        uint value = imageLoad(input_img[0], ivec2(pos)).x >> shift;
-+        atomicAdd(wg_row_sum[gl_LocalInvocationID.y], value);
-+        atomicAdd(wg_col_sum[gl_LocalInvocationID.x], value);
-+    }
++    uint value = 0;
++    if (all(lessThan(pos, size)))
++        value = imageLoad(input_img[0], ivec2(pos)).x >> shift;
++    tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = value;
 +
 +    barrier();
-+    if (gl_LocalInvocationID.x == 0 && pos.y < height)
-+        atomicAdd(line_sum[pos.y], wg_row_sum[gl_LocalInvocationID.y]);
-+    if (gl_LocalInvocationID.y == 0 && pos.x < width)
-+        atomicAdd(line_sum[height + pos.x], wg_col_sum[gl_LocalInvocationID.x]);
++
++    /* the first invocations sum up the columns, the next ones the rows */
++    const uvec2 origin = gl_WorkGroupID.xy * gl_WorkGroupSize.xy;
++    const uint index = gl_LocalInvocationIndex;
++    if (index < gl_WorkGroupSize.x) {
++        uint sum = 0;
++        for (uint row = 0; row < gl_WorkGroupSize.y; row++)
++            sum += tile[row][index];
++        if (origin.x + index < width)
++            atomicAdd(line_sum[height + origin.x + index], sum);
++    } else if (index < gl_WorkGroupSize.x + gl_WorkGroupSize.y) {
++        const uint row = index - gl_WorkGroupSize.x;
++        uint sum = 0;
++        for (uint column = 0; column < gl_WorkGroupSize.x; column++)
++            sum += tile[row][column];
++        if (origin.y + row < height)
++            atomicAdd(line_sum[origin.y + row], sum);
++    }
 +}
 -- 
 2.53.0
