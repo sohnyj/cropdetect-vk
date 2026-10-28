@@ -253,12 +253,12 @@ local function handle_toggle(command, suppress_osd)
     end
 
     if enable and mp.get_property_native("current-tracks/video/image") then
-        msg.warn("Limit: image file")
+        msg.warn("Not available for image files")
         return
     end
 
     if enable and not is_vulkan_context() then
-        msg.warn("Limit: gpu-context is not vulkan")
+        msg.warn("Requires gpu-context=vulkan")
         return
     end
 
