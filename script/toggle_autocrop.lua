@@ -24,7 +24,7 @@ local UPLOAD_LABEL = "@" .. autocrop_opts.label .. "_upload"
 local FILTER_COMMAND = "%s:cropdetect_vulkan=limit=%s:reset=1:round=%d" -- reset=1 detects each frame on its own
 local UPLOAD_COMMAND = "%s:format=fmt=vulkan" -- uploads CUDA and software frames to Vulkan
 local DEBOUNCE_SECONDS = 0.3 -- time a detected crop must stay unchanged before it is applied
-local MAX_DETECT_SPEED = 1 -- playback speed above which detection is skipped
+local MAX_DETECT_SPEED = 2.0 -- playback speed above which detection is skipped
 
 local autocrop_state = {
     active = false,
