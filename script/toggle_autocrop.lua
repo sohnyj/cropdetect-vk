@@ -11,7 +11,7 @@ local autocrop_opts = {
     osd = "Autocrop",
     label = "autocrop",
     cropdetect_limit = "24/255",
-    cropdetect_round = 2,
+    cropdetect_round = 16,
     min_apply_width = 0.5,
     min_apply_height = 0.5,
     symmetry_ratio = 0.75,
@@ -29,9 +29,9 @@ local MAX_DETECT_SPEED = 2.0 -- playback speed above which detection is skipped
 local autocrop_state = {
     active = false,
     properties = { speed = 1, seeking = false, pause = false },
-    metadata = nil, -- latest cropdetect metadata
-    applied = nil, -- crop in effect
-    pending = nil, -- detected crop that is applied when the debounce timer expires
+    metadata = nil,
+    applied = nil,
+    pending = nil,
     debounce_timer = nil,
 }
 
@@ -97,9 +97,9 @@ end
 
 local function apply_autocrop(crop)
     if crop.w == crop.max_w and crop.h == crop.max_h then
-        mp.set_property("video-crop", "")
+        mp.set_property("file-local-options/video-crop", "")
     else
-        mp.set_property("video-crop", string.format("%dx%d+%d+%d", crop.w, crop.h, crop.x, crop.y))
+        mp.set_property("file-local-options/video-crop", string.format("%dx%d+%d+%d", crop.w, crop.h, crop.x, crop.y))
     end
 end
 
@@ -147,8 +147,6 @@ local function get_detected_crop(cropdetect_metadata)
     return crop
 end
 
--- mpv notifies the metadata only when it changes, so the latest metadata is
--- detected again when seeking ends or the speed falls back.
 local function update_autocrop()
     local state = autocrop_state
     if not state.metadata or state.properties.seeking or state.properties.speed > MAX_DETECT_SPEED then
@@ -227,7 +225,7 @@ local function cleanup_autocrop()
     if is_filter_active(UPLOAD_LABEL) then
         mp.commandv("vf", "remove", UPLOAD_LABEL)
     end
-    mp.set_property("video-crop", "")
+    mp.set_property("file-local-options/video-crop", "")
 end
 
 local function enable_autocrop(suppress_osd)
@@ -269,7 +267,7 @@ local function handle_toggle(command, suppress_osd)
     end
 end
 
-mp.register_event("end-file", function() handle_toggle("disable", true) end)
+mp.add_hook("on_unload", 50, function() handle_toggle("disable", true) end)
 mp.register_script_message("toggle_autocrop", handle_toggle)
 mp.register_script_message("enable", function() handle_toggle("enable", true) end)
 mp.register_script_message("disable", function() handle_toggle("disable", true) end)
