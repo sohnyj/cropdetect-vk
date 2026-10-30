@@ -1,4 +1,4 @@
-From 06b4e6019794104bb9e0272478fc0c37aa6abd86 Mon Sep 17 00:00:00 2001
+From d736fad706463cd78a4d2c5c9b1f3f171d0148c6 Mon Sep 17 00:00:00 2001
 From: sohnyj <271139641+sohnyj@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 22:43:43 +0900
 Subject: [PATCH] avfilter: add cropdetect_vulkan filter
@@ -30,10 +30,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 libavfilter/vulkan/cropdetect.comp.glsl
 
 diff --git a/configure b/configure
-index 083bd652c4..39ce6b7201 100755
+index ae7950270e..bf60a98e70 100755
 --- a/configure
 +++ b/configure
-@@ -4148,6 +4148,7 @@ coreimagesrc_filter_deps="coreimage appkit"
+@@ -4149,6 +4149,7 @@ coreimagesrc_filter_deps="coreimage appkit"
  coreimagesrc_filter_extralibs="-framework OpenGL"
  cover_rect_filter_deps="avcodec avformat gpl"
  cropdetect_filter_deps="gpl"
@@ -66,10 +66,10 @@ index 37f9123df4..0807685f16 100644
  
  @table @option
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index ef2542b98b..7e2d9332de 100644
+index e00652e456..7e0b0b063a 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
-@@ -265,6 +265,7 @@ OBJS-$(CONFIG_CORR_FILTER)                   += vf_corr.o framesync.o
+@@ -264,6 +264,7 @@ OBJS-$(CONFIG_CORR_FILTER)                   += vf_corr.o framesync.o
  OBJS-$(CONFIG_COVER_RECT_FILTER)             += vf_cover_rect.o lavfutils.o
  OBJS-$(CONFIG_CROP_FILTER)                   += vf_crop.o
  OBJS-$(CONFIG_CROPDETECT_FILTER)             += vf_cropdetect.o edge_common.o
@@ -91,7 +91,7 @@ index 931ac8481e..2437bec7e8 100644
  extern const FFFilter ff_vf_datascope;
 diff --git a/libavfilter/vf_cropdetect_vulkan.c b/libavfilter/vf_cropdetect_vulkan.c
 new file mode 100644
-index 0000000000..e03937dccb
+index 0000000000..69754b40c2
 --- /dev/null
 +++ b/libavfilter/vf_cropdetect_vulkan.c
 @@ -0,0 +1,500 @@
@@ -346,7 +346,7 @@ index 0000000000..e03937dccb
 +    ff_vk_frame_barrier(vkctx, exec, in, img_bar, &nb_img_bar,
 +                        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
 +                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-+                        VK_ACCESS_SHADER_READ_BIT,
++                        VK_ACCESS_2_SHADER_READ_BIT,
 +                        VK_IMAGE_LAYOUT_GENERAL,
 +                        VK_QUEUE_FAMILY_IGNORED);
 +
@@ -357,7 +357,7 @@ index 0000000000..e03937dccb
 +                .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
 +                .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
 +                .dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++                .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
 +                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 +                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 +                .buffer = sum_vk->buf,
@@ -377,7 +377,7 @@ index 0000000000..e03937dccb
 +                .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
 +                .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
 +                .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++                .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
 +                .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
 +                                 VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
 +                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -686,5 +686,5 @@ index 0000000000..0bbbb9e885
 +    }
 +}
 -- 
-2.53.0
+2.43.0
 
